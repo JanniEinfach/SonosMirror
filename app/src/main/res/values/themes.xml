@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">#1DB954</item>
+        <item name="colorPrimaryDark">#158a3e</item>
+        <item name="colorAccent">#1DB954</item>
+        <item name="android:windowBackground">#121212</item>
+    </style>
+</resources>

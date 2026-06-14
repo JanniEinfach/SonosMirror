@@ -1,0 +1,30 @@
+# Android
+*.iml
+.gradle/
+local.properties
+.idea/
+app/build/
+build/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Gradle
+.gradle
+gradle-wrapper.jar
+
+# IntelliJ / Android Studio
+*.iws
+*.ipr
+out/
+captures/
+.externalNativeBuild/
+.cxx/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# audiorelay compiled output (build locally)
+audiorelay/bin/
