@@ -104,14 +104,20 @@ class AudioMirrorService : Service() {
             Thread.sleep(8000)
             if (!isRunning.get()) break
             val state = SonosUPnP.getTransportState(sonosIp)
-            Log.d(TAG, "Watchdog: Sonos=$state")
+            Log.d(TAG, "Watchdog: Sonos=$state failCount=$failCount")
             if (state == "STOPPED" || state == "ERROR") {
                 failCount++
-                Log.w(TAG, "Sonos gestoppt ($failCount), reconnecte...")
-                updateNotification(sonosIp, "Reconnect...")
-                Thread.sleep(500)
-                SonosUPnP.playStream(sonosIp, streamUrl)
-                updateNotification(sonosIp, "Aktiv ▶")
+                // Erst nach 2 hintereinander STOPPED reconnecten —
+                // ein einzelnes STOPPED ist oft nur kurzes Re-Buffering von Sonos
+                if (failCount >= 2) {
+                    Log.w(TAG, "Sonos wirklich gestoppt ($failCount×), reconnecte...")
+                    updateNotification(sonosIp, "Reconnect...")
+                    SonosUPnP.playStream(sonosIp, streamUrl)
+                    updateNotification(sonosIp, "Aktiv ▶")
+                    failCount = 0
+                } else {
+                    Log.d(TAG, "Sonos STOPPED — warte auf nächsten Check bevor reconnect")
+                }
             } else {
                 failCount = 0
             }

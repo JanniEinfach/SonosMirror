@@ -36,8 +36,8 @@ public class Main {
     static final int CHUNK_SIZE  = 1024;   // 1024 = ~5.8ms pro Chunk (minimale Latenz)
 
     static final AtomicBoolean running = new AtomicBoolean(true);
-    // 8 Slots = max ~46ms Software-Puffer; lieber Lücke als Latenz
-    static final BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(8);
+    // 32 Slots = max ~185ms Software-Puffer — schützt gegen kurze GC-Pausen ohne merkbare Latenz
+    static final BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(32);
 
     /** Context-Wrapper der getAttributionSource() auf com.android.shell umleitet */
     static class ShellContext extends ContextWrapper {
@@ -145,7 +145,8 @@ public class Main {
                 .setContext(ctx)
                 .setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX)
                 .setAudioFormat(format)
-                .setBufferSizeInBytes(Math.max(minBuf, CHUNK_SIZE));
+                // minBuf*4 = ~93ms interner Reserve-Puffer gegen GC-Pausen
+                .setBufferSizeInBytes(Math.max(minBuf * 4, CHUNK_SIZE * 8));
 
             // Low-Latency-Modus (API 29+)
             try {
