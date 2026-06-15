@@ -8,12 +8,15 @@ import android.media.AudioRecord;
 import android.media.MediaRecorder;
 import android.os.Looper;
 
+import java.io.BufferedOutputStream;
 import java.io.IOException;
 import java.io.OutputStream;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.TimeUnit;
@@ -22,36 +25,42 @@ import java.util.concurrent.atomic.AtomicBoolean;
 /**
  * Low-Latency REMOTE_SUBMIX → HTTP WAV Stream
  *
- * Zero-Allocation Hot-Path: pre-allocierter Buffer-Pool verhindert GC-Pausen
- * im Capture-Thread, die sonst zu AudioRecord-Overflows führen.
+ * Architektur:
+ *  - Zero-Allocation Pool: 32 pre-allokierte Puffer, kein GC-Druck
+ *  - Pre-Fill-Puffer: 3s Audio werden gesammelt bevor der HTTP-Server
+ *    startet → Sonos kriegt beim Connect sofort einen 3s-Puffer-Burst,
+ *    sodass WiFi-Jitter bis ~3s das Audio nicht unterbricht
+ *  - Batch-Write: 8 Chunks (46ms) pro flush() → weniger Syscalls
  */
 public class Main {
 
-    static final int SAMPLE_RATE = 44100;
-    static final int PORT        = 9877;
-    static final int CHUNK_SIZE  = 1024;  // ~5.8ms pro Chunk
+    static final int SAMPLE_RATE    = 44100;
+    static final int PORT           = 9877;
+    static final int CHUNK_SIZE     = 1024;  // ~5.8ms pro Chunk (AudioRecord-Granularität)
 
-    // Pool-Größe: genug Puffer für ~185ms ohne neue Allokation
-    static final int POOL_SIZE   = 32;
+    // Anzahl Chunks für den Start-Pre-Fill-Puffer (~3 Sekunden)
+    static final int PREFILL_CHUNKS = (int)(3.0 * SAMPLE_RATE * 4 / CHUNK_SIZE); // ≈517
 
-    static final AtomicBoolean running = new AtomicBoolean(true);
+    // Fortlaufender Streaming-Pool (185ms = 32 × 5.8ms)
+    static final int POOL_SIZE      = 32;
 
-    // Pre-allozierte Puffer — werden NIEMALS neu allokiert
-    static final byte[][] bufferPool = new byte[POOL_SIZE][CHUNK_SIZE];
+    // Batching: 8 Chunks auf einmal senden, dann flush() → ~21 flushes/sec
+    static final int BATCH_SIZE     = 8;
 
-    // Freie Puffer, die der Capture-Thread holen kann
+    static final AtomicBoolean running    = new AtomicBoolean(true);
+    static final AtomicBoolean prefillReady = new AtomicBoolean(false);
+
+    static final byte[][] bufferPool   = new byte[POOL_SIZE][CHUNK_SIZE];
     static final BlockingQueue<byte[]> freeBuffers = new ArrayBlockingQueue<>(POOL_SIZE);
-    // Gefüllte Puffer, die der HTTP-Thread senden soll
     static final BlockingQueue<byte[]> audioQueue  = new ArrayBlockingQueue<>(POOL_SIZE);
 
+    // Pre-Fill: separater Heap-Puffer (einmalig beim Start, kein Hot-Path)
+    static final List<byte[]> prefillBuffer = new ArrayList<>(PREFILL_CHUNKS);
+
     static {
-        // Pool einmalig befüllen — danach nie wieder new byte[]
-        for (byte[] buf : bufferPool) {
-            freeBuffers.offer(buf);
-        }
+        for (byte[] buf : bufferPool) freeBuffers.offer(buf);
     }
 
-    /** Context-Wrapper der getAttributionSource() auf com.android.shell umleitet */
     static class ShellContext extends ContextWrapper {
         private final AttributionSource shellSource;
 
@@ -65,7 +74,7 @@ public class Main {
                 ctor.setAccessible(true);
                 tmp = ctor.newInstance(2000, "com.android.shell", null);
             } catch (Exception e) {
-                System.err.println("[ShellContext] AttributionSource Fehler: " + e);
+                System.err.println("[ShellContext] Fehler: " + e);
             }
             shellSource = tmp;
         }
@@ -78,7 +87,7 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         Looper.prepareMainLooper();
-        System.out.println("[audiorelay] Start (Zero-Alloc Pool-Modus)...");
+        System.out.println("[audiorelay] Start...");
 
         Object at = callSystemMain();
         if (at == null) { System.err.println("FEHLER: systemMain()"); System.exit(1); }
@@ -86,31 +95,40 @@ public class Main {
         Context sysCtx = getSystemContext(at);
         if (sysCtx == null) { System.err.println("FEHLER: kein Context"); System.exit(1); }
 
-        ShellContext shellCtx = new ShellContext(sysCtx);
-
-        AudioRecord record = buildAudioRecord(shellCtx);
+        AudioRecord record = buildAudioRecord(new ShellContext(sysCtx));
         if (record == null || record.getState() != AudioRecord.STATE_INITIALIZED) {
-            System.err.println("[audiorelay] FEHLER: AudioRecord nicht initialisiert");
+            System.err.println("[audiorelay] AudioRecord nicht initialisiert");
             System.exit(1);
         }
 
         record.startRecording();
         if (record.getRecordingState() != AudioRecord.RECORDSTATE_RECORDING) {
-            System.err.println("[audiorelay] FEHLER: startRecording() gescheitert");
+            System.err.println("[audiorelay] startRecording() gescheitert");
             System.exit(1);
         }
 
         int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-        System.out.printf("[audiorelay] OK! minBuf=%d bytes (×4=%d), chunk=%d bytes (≈%.1fms), pool=%d bufs, Port=%d%n",
-            minBuf, minBuf * 4, CHUNK_SIZE, (CHUNK_SIZE / 4.0 / SAMPLE_RATE) * 1000.0, POOL_SIZE, PORT);
+        System.out.printf("[audiorelay] minBuf=%d (×4=%d), chunk=%d bytes (~%.1fms), prefill=%d chunks (~3s), pool=%d%n",
+            minBuf, minBuf * 4, CHUNK_SIZE,
+            (CHUNK_SIZE / 4.0 / SAMPLE_RATE) * 1000.0,
+            PREFILL_CHUNKS, POOL_SIZE);
 
-        // Capture-Thread: KEINERLEI Allokation im Hot-Path
+        // Phase 1: Pre-Fill-Puffer befüllen (auf eigenem Heap, nicht vom Pool)
+        System.out.println("[audiorelay] Sammle Pre-Fill (" + PREFILL_CHUNKS + " chunks = ~3s)...");
+        for (int i = 0; i < PREFILL_CHUNKS; i++) {
+            byte[] buf = new byte[CHUNK_SIZE];
+            int n = record.read(buf, 0, buf.length);
+            if (n > 0) prefillBuffer.add(buf);
+        }
+        prefillReady.set(true);
+        System.out.println("[audiorelay] Pre-Fill fertig. Starte HTTP-Server...");
+
+        // Phase 2: Capture-Thread (Zero-Alloc-Pool)
         Thread captureThread = new Thread(() -> {
             int logCount = 0;
             int overflowCount = 0;
             while (running.get()) {
-                // Freien Puffer aus dem Pool holen (kurzer Timeout statt ewig blockieren)
                 byte[] buf;
                 try {
                     buf = freeBuffers.poll(50, TimeUnit.MILLISECONDS);
@@ -118,7 +136,6 @@ public class Main {
                     break;
                 }
                 if (buf == null) {
-                    // Pool leer = HTTP-Thread hängt, alten Frame droppen
                     buf = audioQueue.poll();
                     if (buf == null) continue;
                     overflowCount++;
@@ -126,7 +143,7 @@ public class Main {
 
                 int n = record.read(buf, 0, buf.length);
                 if (n <= 0) {
-                    freeBuffers.offer(buf); // Puffer zurücklegen
+                    freeBuffers.offer(buf);
                     continue;
                 }
 
@@ -137,14 +154,12 @@ public class Main {
                         int a = Math.abs(s);
                         if (a > maxAmp) maxAmp = a;
                     }
-                    System.out.println("[audiorelay] " + n + " bytes, maxAmp=" + maxAmp
-                        + (maxAmp < 10 ? " (STILLE)" : " (AUDIO!)")
+                    System.out.println("[audiorelay] " + n + " bytes maxAmp=" + maxAmp
+                        + (maxAmp < 10 ? " STILLE" : " AUDIO")
                         + " overflows=" + overflowCount);
                 }
 
-                // Puffer an HTTP-Thread übergeben
                 if (!audioQueue.offer(buf)) {
-                    // Queue voll: ältesten Frame rauswerfen, zurück in Pool
                     byte[] dropped = audioQueue.poll();
                     if (dropped != null) freeBuffers.offer(dropped);
                     audioQueue.offer(buf);
@@ -160,56 +175,28 @@ public class Main {
     static AudioRecord buildAudioRecord(Context ctx) {
         try {
             int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT);
-
-            AudioFormat format = new AudioFormat.Builder()
-                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                .setSampleRate(SAMPLE_RATE)
-                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
-                .build();
+                AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
 
             AudioRecord.Builder builder = new AudioRecord.Builder()
                 .setContext(ctx)
                 .setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX)
-                .setAudioFormat(format)
-                // 4× minBuf (~93ms) gegen GC-Pausen im Kernel-Buffer
+                .setAudioFormat(new AudioFormat.Builder()
+                    .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                    .setSampleRate(SAMPLE_RATE)
+                    .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                    .build())
                 .setBufferSizeInBytes(Math.max(minBuf * 4, CHUNK_SIZE * 8));
 
             try {
                 java.lang.reflect.Method m = AudioRecord.Builder.class
                     .getMethod("setPerformanceMode", int.class);
-                m.invoke(builder, 1); // PERFORMANCE_MODE_LOW_LATENCY = 1
-                System.out.println("[audiorelay] Low-Latency-Modus aktiviert");
-            } catch (Exception ignored) {
-                System.out.println("[audiorelay] Standard-Modus");
-            }
+                m.invoke(builder, 1);
+                System.out.println("[audiorelay] Low-Latency-Modus");
+            } catch (Exception ignored) {}
 
             return builder.build();
         } catch (Exception e) {
-            System.err.println("[audiorelay] AudioRecord-Exception: " + e);
-            return null;
-        }
-    }
-
-    static Object callSystemMain() {
-        try {
-            Class<?> atClass = Class.forName("android.app.ActivityThread");
-            java.lang.reflect.Method m = atClass.getMethod("systemMain");
-            return m.invoke(null);
-        } catch (Exception e) {
-            System.err.println("systemMain Fehler: " + e);
-            return null;
-        }
-    }
-
-    static Context getSystemContext(Object activityThread) {
-        try {
-            Class<?> atClass = activityThread.getClass();
-            java.lang.reflect.Method m = atClass.getMethod("getSystemContext");
-            return (Context) m.invoke(activityThread);
-        } catch (Exception e) {
-            System.err.println("getSystemContext Fehler: " + e);
+            System.err.println("[audiorelay] AudioRecord-Fehler: " + e);
             return null;
         }
     }
@@ -217,7 +204,7 @@ public class Main {
     static void runHttpServer(AudioRecord record) {
         try (ServerSocket ss = new ServerSocket(PORT)) {
             ss.setReuseAddress(true);
-            System.out.println("[audiorelay] Server läuft auf :" + PORT);
+            System.out.println("[audiorelay] HTTP-Server auf :" + PORT);
             while (running.get()) {
                 try {
                     Socket client = ss.accept();
@@ -238,38 +225,51 @@ public class Main {
     static void handleClient(Socket socket) {
         try {
             socket.setTcpNoDelay(true);
-            socket.setSendBufferSize(65536); // Großer TCP-Sendepuffer gegen Netzwerk-Jitter
+            socket.setSendBufferSize(131072); // 128KB TCP-Sendepuffer
 
             byte[] reqBuf = new byte[2048];
             int n = socket.getInputStream().read(reqBuf);
             boolean isGet = n > 0 && new String(reqBuf, 0, n).startsWith("GET");
 
-            OutputStream out = socket.getOutputStream();
-            String header = "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
-            out.write(header.getBytes());
+            // 64KB buffered output → reduziert flush()-Overhead drastisch
+            BufferedOutputStream out = new BufferedOutputStream(socket.getOutputStream(), 65536);
 
-            if (!isGet) return;
-
+            out.write(("HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n").getBytes());
             out.write(buildWavHeader());
+
+            if (!isGet) {
+                out.flush();
+                return;
+            }
+
+            // Pre-Fill-Burst: sende ~3s Audio auf einmal → Sonos baut stabilen Puffer auf
+            System.out.println("[audiorelay] Client verbunden, sende Pre-Fill (" + prefillBuffer.size() + " chunks)...");
+            for (byte[] chunk : prefillBuffer) {
+                out.write(chunk);
+            }
             out.flush();
 
-            // Alle noch im audioQueue befindlichen alten Frames verwerfen,
-            // Puffer zurück in den Free-Pool
+            // Während Pre-Fill-Send hat CaptureThread weitergelaufen → alte Frames entsorgen
             byte[] stale;
             while ((stale = audioQueue.poll()) != null) {
                 freeBuffers.offer(stale);
             }
-            System.out.println("[audiorelay] Client verbunden, Queue gespült, streame live...");
+            System.out.println("[audiorelay] Pre-Fill gesendet. Streame live...");
 
+            // Live-Stream: 8 Chunks batchen, dann flush
+            int batchCount = 0;
             while (running.get()) {
-                byte[] chunk = audioQueue.take(); // blockiert bis Daten da
+                byte[] chunk = audioQueue.take();
                 out.write(chunk);
-                out.flush();
-                freeBuffers.offer(chunk); // Puffer sofort zurück in den Pool
+                freeBuffers.offer(chunk);
+                if (++batchCount >= BATCH_SIZE) {
+                    out.flush();
+                    batchCount = 0;
+                }
             }
+
         } catch (Exception e) {
             System.out.println("[audiorelay] Client weg: " + e.getMessage());
-            // Alle hängenden Frames zurück in den Pool
             byte[] leftover;
             while ((leftover = audioQueue.poll()) != null) {
                 freeBuffers.offer(leftover);
@@ -289,5 +289,24 @@ public class Main {
         b.putShort((short)4); b.putShort((short)16);
         b.put("data".getBytes()); b.putInt(0x7FFFFFFF);
         return b.array();
+    }
+
+    static Object callSystemMain() {
+        try {
+            Class<?> c = Class.forName("android.app.ActivityThread");
+            return c.getMethod("systemMain").invoke(null);
+        } catch (Exception e) {
+            System.err.println("systemMain: " + e);
+            return null;
+        }
+    }
+
+    static Context getSystemContext(Object at) {
+        try {
+            return (Context) at.getClass().getMethod("getSystemContext").invoke(at);
+        } catch (Exception e) {
+            System.err.println("getSystemContext: " + e);
+            return null;
+        }
     }
 }
