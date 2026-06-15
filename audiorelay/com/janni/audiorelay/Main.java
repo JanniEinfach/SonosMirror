@@ -16,28 +16,40 @@ import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Low-Latency REMOTE_SUBMIX → HTTP WAV Stream
- * Optimierungen:
- *  - CHUNK_SIZE=1024 → 5.8ms pro Chunk
- *  - AudioRecord-Puffer = genau minBuf (kein künstliches Maximum)
- *  - PERFORMANCE_MODE_LOW_LATENCY
- *  - TCP_NODELAY auf Client-Socket
- *  - Queue nur 8 Slots → max ~46ms Software-Puffer
- *  - flush() nach jedem Chunk
- *  - queue.clear() bei Connect UND Disconnect (nie veraltete Daten senden)
+ *
+ * Zero-Allocation Hot-Path: pre-allocierter Buffer-Pool verhindert GC-Pausen
+ * im Capture-Thread, die sonst zu AudioRecord-Overflows führen.
  */
 public class Main {
 
     static final int SAMPLE_RATE = 44100;
     static final int PORT        = 9877;
-    static final int CHUNK_SIZE  = 1024;   // 1024 = ~5.8ms pro Chunk (minimale Latenz)
+    static final int CHUNK_SIZE  = 1024;  // ~5.8ms pro Chunk
+
+    // Pool-Größe: genug Puffer für ~185ms ohne neue Allokation
+    static final int POOL_SIZE   = 32;
 
     static final AtomicBoolean running = new AtomicBoolean(true);
-    // 32 Slots = max ~185ms Software-Puffer — schützt gegen kurze GC-Pausen ohne merkbare Latenz
-    static final BlockingQueue<byte[]> queue = new ArrayBlockingQueue<>(32);
+
+    // Pre-allozierte Puffer — werden NIEMALS neu allokiert
+    static final byte[][] bufferPool = new byte[POOL_SIZE][CHUNK_SIZE];
+
+    // Freie Puffer, die der Capture-Thread holen kann
+    static final BlockingQueue<byte[]> freeBuffers = new ArrayBlockingQueue<>(POOL_SIZE);
+    // Gefüllte Puffer, die der HTTP-Thread senden soll
+    static final BlockingQueue<byte[]> audioQueue  = new ArrayBlockingQueue<>(POOL_SIZE);
+
+    static {
+        // Pool einmalig befüllen — danach nie wieder new byte[]
+        for (byte[] buf : bufferPool) {
+            freeBuffers.offer(buf);
+        }
+    }
 
     /** Context-Wrapper der getAttributionSource() auf com.android.shell umleitet */
     static class ShellContext extends ContextWrapper {
@@ -66,8 +78,7 @@ public class Main {
 
     public static void main(String[] args) throws Exception {
         Looper.prepareMainLooper();
-
-        System.out.println("[audiorelay] Start (Low-Latency-Modus)...");
+        System.out.println("[audiorelay] Start (Zero-Alloc Pool-Modus)...");
 
         Object at = callSystemMain();
         if (at == null) { System.err.println("FEHLER: systemMain()"); System.exit(1); }
@@ -91,34 +102,52 @@ public class Main {
 
         int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
             AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-        double latencyMs = (minBuf / 4.0 / SAMPLE_RATE) * 1000.0;
-        System.out.printf("[audiorelay] OK! minBuf=%d bytes (≈%.1fms), chunk=%d bytes (≈%.1fms), Port=%d%n",
-            minBuf, latencyMs, CHUNK_SIZE, (CHUNK_SIZE / 4.0 / SAMPLE_RATE) * 1000.0, PORT);
+        System.out.printf("[audiorelay] OK! minBuf=%d bytes (×4=%d), chunk=%d bytes (≈%.1fms), pool=%d bufs, Port=%d%n",
+            minBuf, minBuf * 4, CHUNK_SIZE, (CHUNK_SIZE / 4.0 / SAMPLE_RATE) * 1000.0, POOL_SIZE, PORT);
 
-        // Capture-Thread: liest REMOTE_SUBMIX und füllt die Queue
+        // Capture-Thread: KEINERLEI Allokation im Hot-Path
         Thread captureThread = new Thread(() -> {
-            byte[] buf = new byte[CHUNK_SIZE];
             int logCount = 0;
+            int overflowCount = 0;
             while (running.get()) {
+                // Freien Puffer aus dem Pool holen (kurzer Timeout statt ewig blockieren)
+                byte[] buf;
+                try {
+                    buf = freeBuffers.poll(50, TimeUnit.MILLISECONDS);
+                } catch (InterruptedException e) {
+                    break;
+                }
+                if (buf == null) {
+                    // Pool leer = HTTP-Thread hängt, alten Frame droppen
+                    buf = audioQueue.poll();
+                    if (buf == null) continue;
+                    overflowCount++;
+                }
+
                 int n = record.read(buf, 0, buf.length);
-                if (n > 0) {
-                    if (logCount++ % 1000 == 0) {
-                        int maxAmp = 0;
-                        for (int i = 0; i < n - 1; i += 2) {
-                            int s = (buf[i] & 0xFF) | (buf[i + 1] << 8);
-                            int a = Math.abs(s);
-                            if (a > maxAmp) maxAmp = a;
-                        }
-                        System.out.println("[audiorelay] " + n + " bytes, maxAmp=" + maxAmp
-                            + (maxAmp < 10 ? " (STILLE)" : " (AUDIO!)"));
+                if (n <= 0) {
+                    freeBuffers.offer(buf); // Puffer zurücklegen
+                    continue;
+                }
+
+                if (logCount++ % 1000 == 0) {
+                    int maxAmp = 0;
+                    for (int i = 0; i < n - 1; i += 2) {
+                        int s = (buf[i] & 0xFF) | (buf[i + 1] << 8);
+                        int a = Math.abs(s);
+                        if (a > maxAmp) maxAmp = a;
                     }
-                    byte[] chunk = new byte[n];
-                    System.arraycopy(buf, 0, chunk, 0, n);
-                    // Wenn Queue voll: älteste Daten verwerfen (lieber Lücke als Latenz)
-                    if (!queue.offer(chunk)) {
-                        queue.poll();
-                        queue.offer(chunk);
-                    }
+                    System.out.println("[audiorelay] " + n + " bytes, maxAmp=" + maxAmp
+                        + (maxAmp < 10 ? " (STILLE)" : " (AUDIO!)")
+                        + " overflows=" + overflowCount);
+                }
+
+                // Puffer an HTTP-Thread übergeben
+                if (!audioQueue.offer(buf)) {
+                    // Queue voll: ältesten Frame rauswerfen, zurück in Pool
+                    byte[] dropped = audioQueue.poll();
+                    if (dropped != null) freeBuffers.offer(dropped);
+                    audioQueue.offer(buf);
                 }
             }
         }, "CaptureThread");
@@ -130,7 +159,6 @@ public class Main {
 
     static AudioRecord buildAudioRecord(Context ctx) {
         try {
-            // Genau minBuf verwenden — kein künstliches Maximum für niedrigste Latenz
             int minBuf = AudioRecord.getMinBufferSize(SAMPLE_RATE,
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT);
@@ -145,17 +173,16 @@ public class Main {
                 .setContext(ctx)
                 .setAudioSource(MediaRecorder.AudioSource.REMOTE_SUBMIX)
                 .setAudioFormat(format)
-                // minBuf*4 = ~93ms interner Reserve-Puffer gegen GC-Pausen
+                // 4× minBuf (~93ms) gegen GC-Pausen im Kernel-Buffer
                 .setBufferSizeInBytes(Math.max(minBuf * 4, CHUNK_SIZE * 8));
 
-            // Low-Latency-Modus (API 29+)
             try {
                 java.lang.reflect.Method m = AudioRecord.Builder.class
                     .getMethod("setPerformanceMode", int.class);
                 m.invoke(builder, 1); // PERFORMANCE_MODE_LOW_LATENCY = 1
                 System.out.println("[audiorelay] Low-Latency-Modus aktiviert");
             } catch (Exception ignored) {
-                System.out.println("[audiorelay] Low-Latency nicht verfügbar, Standard-Modus");
+                System.out.println("[audiorelay] Standard-Modus");
             }
 
             return builder.build();
@@ -187,8 +214,6 @@ public class Main {
         }
     }
 
-    // ─── HTTP WAV Server ──────────────────────────────────────────────────────
-
     static void runHttpServer(AudioRecord record) {
         try (ServerSocket ss = new ServerSocket(PORT)) {
             ss.setReuseAddress(true);
@@ -212,32 +237,43 @@ public class Main {
 
     static void handleClient(Socket socket) {
         try {
-            socket.setTcpNoDelay(true); // sofortiges Senden, kein Nagle-Stall
-            byte[] buf = new byte[2048];
-            int n = socket.getInputStream().read(buf);
-            boolean isGet = n > 0 && new String(buf, 0, n).startsWith("GET");
+            socket.setTcpNoDelay(true);
+            socket.setSendBufferSize(65536); // Großer TCP-Sendepuffer gegen Netzwerk-Jitter
+
+            byte[] reqBuf = new byte[2048];
+            int n = socket.getInputStream().read(reqBuf);
+            boolean isGet = n > 0 && new String(reqBuf, 0, n).startsWith("GET");
 
             OutputStream out = socket.getOutputStream();
             String header = "HTTP/1.0 200 OK\r\nContent-Type: audio/wav\r\nConnection: close\r\n\r\n";
             out.write(header.getBytes());
 
-            if (!isGet) { return; }
+            if (!isGet) return;
 
             out.write(buildWavHeader());
             out.flush();
 
-            // Veraltete Daten SOFORT verwerfen — neuer Client kriegt nur frisches Audio
-            queue.clear();
-            System.out.println("[audiorelay] Client verbunden, Queue geleert, streame live...");
+            // Alle noch im audioQueue befindlichen alten Frames verwerfen,
+            // Puffer zurück in den Free-Pool
+            byte[] stale;
+            while ((stale = audioQueue.poll()) != null) {
+                freeBuffers.offer(stale);
+            }
+            System.out.println("[audiorelay] Client verbunden, Queue gespült, streame live...");
 
             while (running.get()) {
-                byte[] chunk = queue.take(); // Blockierend — kein Stille-Fallback
+                byte[] chunk = audioQueue.take(); // blockiert bis Daten da
                 out.write(chunk);
-                out.flush(); // Sofort senden, nicht auf TCP-Puffer warten
+                out.flush();
+                freeBuffers.offer(chunk); // Puffer sofort zurück in den Pool
             }
         } catch (Exception e) {
             System.out.println("[audiorelay] Client weg: " + e.getMessage());
-            queue.clear(); // Veraltete Daten verwerfen für sauberen Reconnect
+            // Alle hängenden Frames zurück in den Pool
+            byte[] leftover;
+            while ((leftover = audioQueue.poll()) != null) {
+                freeBuffers.offer(leftover);
+            }
         } finally {
             try { socket.close(); } catch (IOException ignored) {}
         }
