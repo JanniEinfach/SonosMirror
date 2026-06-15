@@ -39,8 +39,8 @@ public class Main {
     // 1 Sekunde Pre-Fill (~172 Chunks) — Kompromiss: ~1.5s Delay, stabil gegen WiFi-Jitter
     static final int PREFILL_CHUNKS = (int)(1.0 * SAMPLE_RATE * 4 / CHUNK_SIZE);
 
-    static final int POOL_SIZE      = 32;
-    static final int BATCH_SIZE     = 8; // 8 Chunks pro flush = ~46ms Batch
+    static final int POOL_SIZE      = 64; // 64 × 5.8ms = ~370ms Puffer gegen TCP-Stalls
+    static final int BATCH_SIZE     = 8;  // 8 Chunks pro flush = ~46ms Batch
 
     static final AtomicBoolean running     = new AtomicBoolean(true);
     static final AtomicBoolean prefillReady = new AtomicBoolean(false);
@@ -49,9 +49,6 @@ public class Main {
     static final byte[][] bufferPool   = new byte[POOL_SIZE][CHUNK_SIZE];
     static final BlockingQueue<byte[]> freeBuffers = new ArrayBlockingQueue<>(POOL_SIZE);
     static final BlockingQueue<byte[]> audioQueue  = new ArrayBlockingQueue<>(POOL_SIZE);
-
-    // Stille-Chunk für Fallback wenn AudioRecord kurz hängt
-    static final byte[] SILENCE = new byte[CHUNK_SIZE];
 
     // Pre-Fill-Puffer (Heap, kein Pool)
     static final List<byte[]> prefillBuffer = new ArrayList<>(PREFILL_CHUNKS);
@@ -238,17 +235,12 @@ public class Main {
             while ((stale = audioQueue.poll()) != null) freeBuffers.offer(stale);
             System.out.println("[audiorelay] Pre-Fill gesendet. Streame live...");
 
-            // Live-Stream: 8 Chunks batchen, sonst Silence senden (verhindert TCP-Lücken)
+            // Live-Stream: blockierend warten, 8 Chunks per flush
             int batchCount = 0;
             while (running.get()) {
-                byte[] chunk = audioQueue.poll(20, TimeUnit.MILLISECONDS);
-                if (chunk == null) {
-                    // AudioRecord-Verzögerung: Stille senden statt TCP-Lücke erzeugen
-                    out.write(SILENCE);
-                } else {
-                    out.write(chunk);
-                    freeBuffers.offer(chunk);
-                }
+                byte[] chunk = audioQueue.take();
+                out.write(chunk);
+                freeBuffers.offer(chunk);
                 if (++batchCount >= BATCH_SIZE) {
                     out.flush();
                     batchCount = 0;
